@@ -22,18 +22,43 @@ interleaving that produces a duplicate is traced in
 Requires Go 1.24 or newer. Nothing else.
 
 ```bash
-go run .                 # starts on :8080, log at data/queue.wal
-go run ./cmd/demo        # in another shell: a narrated tour of every feature
+make demo      # a complete self contained tour, nothing to set up
+make verify    # build, gofmt, vet, race suite, live SIGKILL durability proof
 ```
 
-The demo creates a delayed priority LIFO queue and walks through ordering,
-delay, consumer crash recovery, dead lettering, log replay, and a concurrent
-drain, printing what it expects and what it got at each step.
+`make demo` starts a server against a temporary log, walks every feature with
+the HTTP calls printed as it makes them, hard kills the process with SIGKILL,
+restarts it, proves the data came back, and cleans up after itself. It never
+touches `./data`, so it is safe to run repeatedly. Use `PORT=9000 make demo` if
+8080 is busy.
+
+`make verify` is the single verdict. It exits non zero if anything is wrong, so
+a reviewer can run one command and trust the answer rather than reading output.
+
+```
+go build                           PASS
+gofmt                              PASS
+go vet                             PASS
+test count                         PASS
+    28 tests
+go test -race                      PASS
+durability under SIGKILL           PASS
+    3 messages and the priority LIFO config survived SIGKILL
+
+All checks passed.
+```
+
+To drive it by hand instead:
 
 ```bash
-go test -race ./queue/           # full suite under the race detector
-go test -bench=. -run=XXX ./queue/
+make run                                  # server on :8080, durable log at ./data
+go run ./cmd/demo                         # in another shell
+curl -s localhost:8080/queues | jq
 ```
+
+`make` on its own lists every target. **Stop the server before `make clean`.**
+Deleting the log out from under a running process is not detected: it keeps
+accepting writes into the unlinked file and they are lost on restart.
 
 ---
 
@@ -137,6 +162,8 @@ since been handed to someone else (`TestStaleReceiptRejected`).
 | `api.go` | HTTP handlers, standard library router only |
 | `main.go` | flags, logging, graceful shutdown |
 | `cmd/demo/main.go` | the demo client |
+| `scripts/demo.sh` | the automated tour, including the SIGKILL proof |
+| `scripts/verify.sh` | every check, one exit code |
 
 ---
 
@@ -620,6 +647,10 @@ Stated plainly, since the honest list is more useful than a feature list.
   total at 12 hours from first receipt.
 - **No delete queue, no purge, no peek.** Queues can be created but not
   removed.
+- **Deleting the log under a running process is not detected.** On Unix the
+  unlinked inode stays alive, so the server keeps fsyncing and returning 201
+  into a file with no name, and the writes are gone on restart. Detecting it
+  means periodically comparing the open descriptor's inode against the path.
 - **No message size limit,** so a single enormous body could exhaust memory.
 - **Group commit is all or nothing per process.** It cannot be selected per
   queue or per message, though the right design is probably a durability level
