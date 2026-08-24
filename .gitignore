@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 dist/
 build/
+data/
+*.wal
+*.wal.compacting
