@@ -22,6 +22,8 @@ interleaving that produces a duplicate is traced in
 Requires Go 1.24 or newer. Nothing else.
 
 ```bash
+git clone https://github.com/Ranoobaba/artie-takehome && cd artie-takehome
+
 make demo      # a complete self contained tour, nothing to set up
 make verify    # build, gofmt, vet, race suite, live SIGKILL durability proof
 ```
@@ -59,6 +61,53 @@ curl -s localhost:8080/queues | jq
 `make` on its own lists every target. **Stop the server before `make clean`.**
 Deleting the log out from under a running process is not detected: it keeps
 accepting writes into the unlinked file and they are lost on restart.
+
+---
+
+## Reviewing this
+
+**Short on time?** `make verify` gives you a verdict in about forty seconds.
+Then read [The core idea](#the-core-idea), which is the whole design in one
+page, and `queue/heaps.go`, which is 96 lines and contains the six line
+function the brief really asks for.
+
+### What the brief asked for
+
+| The brief | Where it lives | How to check it |
+|---|---|---|
+| HTTP application | `api.go` | 11 endpoints, standard library router, no framework |
+| FIFO or LIFO | `orderBy` in `queue/heaps.go` | `TestFIFO`, `TestLIFO` |
+| Priority | the same function | `TestPriorityFIFO`, `TestPriorityLIFO` |
+| Delay | `VisibleAt` in `queue/msg.go` | `TestDelayGate` |
+| Delayed priority LIFO, priority FIFO | the two compose, no special case | `TestDelayedPriorityLIFO` |
+| An application that uses the queue | `cmd/demo` | `make demo` |
+| Persisted, durable, survives restarts | `queue/wal.go` | `TestSurvivesRestart`, `TestTornTailIsDiscarded`, and the SIGKILL proof in `make verify` |
+| Storage not delegated to a queue or database | `go.mod` | zero dependencies; the storage engine is one file |
+| Must support concurrency | `queue/queue.go` | `go test -race`, `TestConcurrentNoLossNoDuplicates` |
+
+### The four additional questions
+
+| Question | Answer |
+|---|---|
+| How do you handle replay messages? | [Replay](#how-do-you-handle-replay) — and it is also a working endpoint, not just prose |
+| How would you refactor into Pub/Sub? | [Pub/Sub](#how-would-you-refactor-your-queue-into-a-pubsub) |
+| What would you add with more time? | [More time](#if-you-had-more-time-what-other-features-would-you-add) |
+| Why choose this over SQS, RabbitMQ or Pulsar? | [Why this](#why-would-users-choose-your-queue-over-incumbents-like-amazon-sqs-rabbitmq-or-apache-pulsar) |
+
+Two sections worth reading even if you skip the rest:
+[Replication](#replication-the-largest-gap), because it is the largest gap and
+the fix is unusually clean, and [Limitations](#limitations), which is the
+honest list rather than a feature list.
+
+### Reading the code
+
+Bottom up, about twenty minutes:
+
+1. `queue/msg.go` (60 lines) — the two fields that carry the two axes
+2. `queue/heaps.go` (96 lines) — one heap type, three comparators, `orderBy`
+3. `queue/queue.go` — enqueue, lease, ack, expiry, dead letter
+4. `queue/wal.go` — the storage engine: append, fsync, CRC, recover, compact
+5. `queue/manager.go` — many queues, crash recovery, replay
 
 ---
 
