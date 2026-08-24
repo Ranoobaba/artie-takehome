@@ -47,7 +47,7 @@ type Msg struct {
 	// a stale receipt from an expired lease cannot acknowledge work that has
 	// since been handed to somebody else.
 	Receipt     string    `json:"receipt,omitempty"`
-	LeaseExpiry time.Time `json:"lease_expiry,omitempty"`
+	LeaseExpiry time.Time `json:"lease_expiry,omitzero"`
 
 	// index is maintained by the heap implementation so that a specific
 	// message can be removed in O(log n) instead of scanning. See heaps.go.

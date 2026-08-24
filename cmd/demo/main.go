@@ -106,10 +106,11 @@ func main() {
 
 	section("6. Replaying history straight out of the write ahead log")
 	var mark struct {
-		Offset int64 `json:"offset"`
+		Epoch  uint64 `json:"epoch"`
+		Offset int64  `json:"offset"`
 	}
-	getInto("/offset", &mark)
-	fmt.Printf("   bookmarking the log at byte %d\n", mark.Offset)
+	getInto("/bookmark", &mark)
+	fmt.Printf("   bookmarking the log at epoch %d byte %d\n", mark.Epoch, mark.Offset)
 	enqueue(name, "audit-event-1", 1, 0)
 	enqueue(name, "audit-event-2", 1, 0)
 	for _, m := range receive(name, 10, 5000, 0) {
@@ -118,6 +119,7 @@ func main() {
 	fmt.Println("   both consumed and acked, queue is empty")
 	post("/queues/"+name+"/replay", map[string]any{
 		"source":      "log",
+		"epoch":       mark.Epoch,
 		"from_offset": mark.Offset,
 	})
 	fmt.Println("   replayed from the bookmark, so they are back:")

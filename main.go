@@ -46,7 +46,7 @@ func main() {
 	}
 	log.Info("recovered from log",
 		"path", *wal,
-		"bytes", mgr.Offset(),
+		"bytes", mgr.Bookmark().Offset,
 		"queues", len(mgr.List()),
 		"took", time.Since(start))
 	if *fsyncEvery > 0 {
@@ -79,12 +79,19 @@ func main() {
 	}()
 
 	<-stop
+	signal.Stop(stop)
 	log.Info("shutting down")
 
+	// Long polls can legitimately hold a handler open, so a graceful drain
+	// may not finish. When it does not, connections are force closed BEFORE
+	// the log is closed. Closing the log first would pull it out from under
+	// a live ack, which returns a 500 for work that was actually completed
+	// and then redelivers it after the restart.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Error("graceful shutdown failed", "error", err)
+		log.Error("graceful shutdown timed out, forcing connections closed", "error", err)
+		srv.Close()
 	}
 	// Close last, so the final fsync happens after the last request has been
 	// served rather than underneath it.

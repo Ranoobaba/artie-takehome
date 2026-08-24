@@ -70,9 +70,14 @@ type Stats struct {
 	Expired   uint64 `json:"total_lease_expiries"`
 
 	// OldestReadyAgeMS is the first number an operator asks for when a queue
-	// looks wedged, so it is cheaper to expose it than to explain how to
-	// derive it.
+	// looks wedged. It measures from EnqueuedAt, which never moves, rather
+	// than from VisibleAt, which is rewritten on every redelivery and would
+	// reset the metric exactly when a message is having trouble.
 	OldestReadyAgeMS int64 `json:"oldest_ready_age_ms"`
+
+	// Degraded reports a storage error that happened on a background path,
+	// where there was no request left to return it to.
+	Degraded string `json:"degraded,omitempty"`
 }
 
 // Queue is a single named queue: three heaps, a lock, and a write ahead log.
@@ -101,15 +106,18 @@ type Queue struct {
 
 	enqueued, delivered, acked, nacked, expired uint64
 
-	// notify wakes long polling receivers. It is buffered with capacity one
-	// and written non blockingly, so it behaves as a "something changed"
-	// edge rather than a queue of events. A missed signal is harmless
-	// because receivers also wake on their own timer.
-	notify chan struct{}
+	// walErr latches a storage failure that happened on the background pump,
+	// where no caller was waiting to be told. It surfaces through Stats.
+	walErr error
+
+	// wake is closed to broadcast to every waiting receiver and then
+	// replaced. A buffered channel would wake exactly one waiter, which
+	// leaves the rest sitting out their full timeout while work is ready.
+	wake chan struct{}
 }
 
 // New builds an empty queue. Recovery from the log is handled separately by
-// the Manager, which replays records through applyRecord.
+// the Manager, which replays records through recover.
 func New(cfg Config, w *WAL) *Queue {
 	if cfg.Mode == "" {
 		cfg.Mode = FIFO
@@ -124,7 +132,7 @@ func New(cfg Config, w *WAL) *Queue {
 		delayed:  newMsgHeap(byVisibleAt),
 		inflight: newMsgHeap(byLeaseExpiry),
 		leases:   make(map[string]*Msg),
-		notify:   make(chan struct{}, 1),
+		wake:     make(chan struct{}),
 	}
 }
 
@@ -158,14 +166,19 @@ func (q *Queue) Enqueue(body string, priority int, delay time.Duration) (Msg, er
 	}
 
 	// Durable first, visible second.
+	//
+	// The sequence number is deliberately NOT rolled back on failure. A write
+	// can fail after its bytes are already framed at their final offset, so
+	// reusing the number would let two live messages share a Seq. That breaks
+	// the total ordering the comparator depends on, and it is far worse than
+	// a gap in the sequence, which nothing depends on.
 	if err := q.wal.AppendSync(Record{Op: OpEnqueue, Queue: q.cfg.Name, Msg: m}); err != nil {
-		q.seq-- // nothing was published, so do not burn the sequence number
 		return Msg{}, err
 	}
 
 	q.placeLocked(m, now)
 	q.enqueued++
-	q.signal()
+	q.signalLocked()
 	return *m, nil
 }
 
@@ -178,10 +191,8 @@ func (q *Queue) Enqueue(body string, priority int, delay time.Duration) (Msg, er
 // the consumer died holding it.
 //
 // wait > 0 turns this into a long poll, so an idle consumer parks on a
-// channel instead of hammering the endpoint in a spin loop.
-// ctx cancels the long poll. When it is a request context, a consumer that
-// hangs up frees its server goroutine immediately instead of holding it for
-// the rest of the wait window.
+// channel instead of hammering the endpoint in a spin loop. ctx cancels the
+// wait, so a consumer that hangs up frees its server goroutine immediately.
 func (q *Queue) Receive(ctx context.Context, max int, visibility, wait time.Duration) ([]Msg, error) {
 	if max <= 0 {
 		max = 1
@@ -192,7 +203,7 @@ func (q *Queue) Receive(ctx context.Context, max int, visibility, wait time.Dura
 	deadline := time.Now().Add(wait)
 
 	for {
-		out, err := q.tryReceive(max, visibility)
+		out, wake, err := q.tryReceive(max, visibility)
 		if err != nil {
 			return nil, err
 		}
@@ -204,66 +215,98 @@ func (q *Queue) Receive(ctx context.Context, max int, visibility, wait time.Dura
 		if remaining <= 0 {
 			return nil, nil
 		}
-		// Cap the sleep so that a message becoming visible via the delay
-		// heap still wakes us promptly even if no producer signals.
+		// Cap the sleep so a message whose delay elapses still wakes us
+		// promptly even if nothing signals.
 		if remaining > 50*time.Millisecond {
 			remaining = 50 * time.Millisecond
 		}
+		timer := time.NewTimer(remaining)
 		select {
-		case <-q.notify:
-		case <-time.After(remaining):
+		case <-wake:
+		case <-timer.C:
 		case <-ctx.Done():
+			timer.Stop()
 			return nil, ctx.Err()
 		}
+		timer.Stop()
 	}
 }
 
-func (q *Queue) tryReceive(max int, visibility time.Duration) ([]Msg, error) {
+// tryReceive makes one non blocking attempt. It also returns the wake channel
+// it observed, captured under the lock, so a caller that finds nothing cannot
+// miss a signal that arrives before it starts waiting.
+func (q *Queue) tryReceive(max int, visibility time.Duration) ([]Msg, chan struct{}, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	wake := q.wake
 	now := time.Now()
 	q.advanceLocked(now)
 
-	var leased []*Msg
-	for len(leased) < max {
+	var picked []*Msg
+	for len(picked) < max {
 		m := q.ready.peek()
 		if m == nil {
 			break
 		}
 		heap.Pop(q.ready)
-
-		m.Attempts++
-		m.Receipt = newID()
-		m.LeaseExpiry = now.Add(visibility)
-		heap.Push(q.inflight, m)
-		q.leases[m.Receipt] = m
-		q.delivered++
-		leased = append(leased, m)
+		picked = append(picked, m)
 	}
-	if len(leased) == 0 {
-		return nil, nil
+	if len(picked) == 0 {
+		return nil, wake, nil
 	}
 
-	// Lease records are appended but deliberately NOT fsynced. Losing a
-	// lease record in a crash only causes a redelivery, which at least once
-	// delivery already permits. Paying an fsync per receive to prevent a
-	// duplicate we are allowed to produce anyway would be the wrong trade.
-	for _, m := range leased {
-		if err := q.wal.Append(Record{Op: OpLease, Queue: q.cfg.Name, Msg: m}); err != nil {
-			return nil, err
+	// Work out the post lease state and log it BEFORE touching the messages.
+	//
+	// Enqueue and Ack both write the log first, and this path has to as well.
+	// Mutating first and then failing would leave the messages leased under
+	// receipts nobody ever received, invisible for the whole visibility
+	// window, with an attempt burned against a delivery that never happened.
+	type lease struct {
+		receipt string
+		expiry  time.Time
+	}
+	leases := make([]lease, len(picked))
+	for i, m := range picked {
+		leases[i] = lease{receipt: newID(), expiry: now.Add(visibility)}
+
+		// The record carries what the message is about to become, not what it
+		// is now, so recovery sees the attempt that is being handed out.
+		snap := *m
+		snap.Attempts++
+		snap.Receipt = leases[i].receipt
+		snap.LeaseExpiry = leases[i].expiry
+
+		// Lease records are appended but deliberately NOT fsynced. Losing one
+		// in a crash only causes a redelivery, which at least once delivery
+		// already permits. Paying an fsync to prevent a duplicate we are
+		// allowed to produce anyway would be the wrong trade.
+		if err := q.wal.Append(Record{Op: OpLease, Queue: q.cfg.Name, Msg: &snap}); err != nil {
+			// Put everything back exactly as it was. The heap restores its
+			// own invariant on push, so order is unaffected.
+			for _, back := range picked {
+				heap.Push(q.ready, back)
+			}
+			return nil, wake, err
 		}
 	}
 
-	// Return copies. The queue keeps mutating these messages after the lock
-	// is released (a lease can expire and the attempt count can change), so
-	// handing out the live pointers would be a data race, and one that the
-	// race detector does catch.
-	out := make([]Msg, 0, len(leased))
-	for _, m := range leased {
+	// Commit.
+	out := make([]Msg, 0, len(picked))
+	for i, m := range picked {
+		m.Attempts++
+		m.Receipt = leases[i].receipt
+		m.LeaseExpiry = leases[i].expiry
+		heap.Push(q.inflight, m)
+		q.leases[m.Receipt] = m
+		q.delivered++
+
+		// Return copies. The queue keeps mutating these messages after the
+		// lock is released, so handing out the live pointers would be a data
+		// race, and one the race detector does catch.
 		out = append(out, *m)
 	}
-	return out, nil
+	return out, wake, nil
 }
 
 // Ack confirms the work is done and permanently removes the message.
@@ -295,23 +338,25 @@ func (q *Queue) Nack(receipt string, delay time.Duration) error {
 	if !ok {
 		return ErrNoLease
 	}
-	if err := q.wal.Append(Record{Op: OpNack, Queue: q.cfg.Name, ID: m.ID}); err != nil {
-		return err
-	}
+
+	now := time.Now()
 	heap.Remove(q.inflight, m.index)
 	delete(q.leases, receipt)
 	m.Receipt = ""
 	m.LeaseExpiry = time.Time{}
 	q.nacked++
-	q.retryLocked(m, time.Now(), delay)
-	q.signal()
+
+	if err := q.retryLocked(m, now, delay); err != nil {
+		return err
+	}
+	q.signalLocked()
 	return nil
 }
 
 // Tick is the periodic pump: it opens delay gates and reclaims expired
 // leases. It is called by the Manager's background goroutine, and also
-// implicitly on every receive so that behaviour does not depend on the
-// ticker's phase.
+// implicitly on every receive so behaviour does not depend on the ticker's
+// phase.
 func (q *Queue) Tick(now time.Time) {
 	q.mu.Lock()
 	q.advanceLocked(now)
@@ -336,8 +381,8 @@ func (q *Queue) advanceLocked(now time.Time) {
 		woke = true
 	}
 
-	// Lease reclamation: a consumer that died holding a message stops
-	// holding it here.
+	// Lease reclamation: a consumer that died holding a message stops holding
+	// it here.
 	for {
 		m := q.inflight.peek()
 		if m == nil || m.LeaseExpiry.After(now) {
@@ -348,12 +393,16 @@ func (q *Queue) advanceLocked(now time.Time) {
 		m.Receipt = ""
 		m.LeaseExpiry = time.Time{}
 		q.expired++
-		q.retryLocked(m, now, 0)
+		if err := q.retryLocked(m, now, 0); err != nil && q.walErr == nil {
+			// Nobody is waiting on this path, so the error is latched and
+			// reported through Stats rather than dropped.
+			q.walErr = err
+		}
 		woke = true
 	}
 
 	if woke {
-		q.signal()
+		q.signalLocked()
 	}
 }
 
@@ -361,14 +410,33 @@ func (q *Queue) advanceLocked(now time.Time) {
 // queue once it has burned through its attempts. Without this cutoff a single
 // poison message would be redelivered forever and would keep a consumer
 // permanently busy failing.
-func (q *Queue) retryLocked(m *Msg, now time.Time, delay time.Duration) {
+func (q *Queue) retryLocked(m *Msg, now time.Time, delay time.Duration) error {
 	if q.cfg.MaxAttempts > 0 && m.Attempts >= q.cfg.MaxAttempts {
+		// Dead lettering is durable. If this record is lost the cutoff is
+		// silently undone on the next restart and the poison message loops
+		// forever, which is the exact failure this function exists to stop.
+		if err := q.wal.AppendSync(Record{Op: OpDLQ, Queue: q.cfg.Name, ID: m.ID}); err != nil {
+			// Keep it inflight-free but visible rather than losing it.
+			m.VisibleAt = now
+			q.placeLocked(m, now)
+			return err
+		}
 		q.dlq = append(q.dlq, m)
-		_ = q.wal.Append(Record{Op: OpDLQ, Queue: q.cfg.Name, ID: m.ID})
-		return
+		return nil
 	}
+
 	m.VisibleAt = now.Add(delay)
+
+	// The backoff has to be durable or a restart erases it. Recovery rebuilds
+	// from the original enqueue record, whose VisibleAt is long past, so
+	// without this every backed off message in the system becomes visible at
+	// once the moment the process restarts.
+	snap := *m
+	if err := q.wal.AppendSync(Record{Op: OpNack, Queue: q.cfg.Name, ID: m.ID, Msg: &snap}); err != nil {
+		return err
+	}
 	q.placeLocked(m, now)
+	return nil
 }
 
 // placeLocked files a message into whichever heap its delay gate implies.
@@ -383,25 +451,35 @@ func (q *Queue) placeLocked(m *Msg, now time.Time) {
 }
 
 // ReplayDLQ moves parked messages back to the head of the pipeline with their
-// attempt counts reset. This is the operational half of the replay story: the
+// attempt counts reset. This is the operational half of the replay story; the
 // historical half lives in the WAL and is exposed by the Manager.
-func (q *Queue) ReplayDLQ() int {
+//
+// It returns the number actually replayed even when it fails partway, so a
+// caller that retries knows what already happened.
+func (q *Queue) ReplayDLQ() (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	now := time.Now()
-	n := len(q.dlq)
-	for _, m := range q.dlq {
+	done := 0
+	for i, m := range q.dlq {
+		if err := q.wal.AppendSync(Record{Op: OpReplay, Queue: q.cfg.Name, ID: m.ID}); err != nil {
+			q.dlq = q.dlq[i:]
+			if done > 0 {
+				q.signalLocked()
+			}
+			return done, err
+		}
 		m.Attempts = 0
 		m.VisibleAt = now
-		_ = q.wal.Append(Record{Op: OpReplay, Queue: q.cfg.Name, ID: m.ID})
 		q.placeLocked(m, now)
+		done++
 	}
 	q.dlq = nil
-	if n > 0 {
-		q.signal()
+	if done > 0 {
+		q.signalLocked()
 	}
-	return n
+	return done, nil
 }
 
 func (q *Queue) Stats() Stats {
@@ -422,13 +500,16 @@ func (q *Queue) Stats() Stats {
 		Nacked:    q.nacked,
 		Expired:   q.expired,
 	}
+	if q.walErr != nil {
+		s.Degraded = q.walErr.Error()
+	}
 	// The heap root is the next message out, not necessarily the oldest, so
 	// this is scanned. Ready depth is bounded in practice and this endpoint
 	// is not on the hot path.
 	oldest := time.Time{}
 	for _, m := range q.ready.items {
-		if oldest.IsZero() || m.VisibleAt.Before(oldest) {
-			oldest = m.VisibleAt
+		if oldest.IsZero() || m.EnqueuedAt.Before(oldest) {
+			oldest = m.EnqueuedAt
 		}
 	}
 	if !oldest.IsZero() {
@@ -437,14 +518,11 @@ func (q *Queue) Stats() Stats {
 	return s
 }
 
-// signal performs a non blocking wake of one long polling receiver. Dropping
-// the signal when the buffer is full is intentional: a receiver is already
-// about to wake, and receivers re-check state on wake anyway.
-func (q *Queue) signal() {
-	select {
-	case q.notify <- struct{}{}:
-	default:
-	}
+// signalLocked wakes every waiting receiver by closing the current wake
+// channel and installing a fresh one. Must be called with q.mu held.
+func (q *Queue) signalLocked() {
+	close(q.wake)
+	q.wake = make(chan struct{})
 }
 
 func newID() string {

@@ -3,11 +3,25 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"artie-takehome/queue"
+)
+
+// Bounds on client supplied durations and batch sizes. Every one of these is
+// a value an unauthenticated caller controls, so each needs a ceiling: an
+// unbounded wait pins a goroutine and a socket for as long as the caller
+// likes, and an unbounded delay overflows into the past and delivers a
+// message immediately, which is the opposite of what was asked for.
+const (
+	maxDelay      = 365 * 24 * time.Hour
+	maxVisibility = 12 * time.Hour
+	maxWait       = 60 * time.Second
+	maxBatch      = 1000
 )
 
 // api is the HTTP surface over the queue manager. It holds no state of its
@@ -32,7 +46,7 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("POST /queues/{name}/nack", a.nack)
 	mux.HandleFunc("POST /queues/{name}/replay", a.replay)
 	mux.HandleFunc("POST /admin/compact", a.compact)
-	mux.HandleFunc("GET /offset", a.offset)
+	mux.HandleFunc("GET /bookmark", a.bookmark)
 	mux.HandleFunc("GET /healthz", a.health)
 
 	return a.withLogging(mux)
@@ -47,6 +61,10 @@ func (a *api) createQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = queue.FIFO
+	}
+	if cfg.VisibilityTimeoutMS < 0 || time.Duration(cfg.VisibilityTimeoutMS)*time.Millisecond > maxVisibility {
+		fail(w, http.StatusBadRequest, fmt.Errorf("visibility_timeout_ms must be between 0 and %d", maxVisibility/time.Millisecond))
+		return
 	}
 	q, err := a.mgr.Create(cfg)
 	if err != nil {
@@ -95,11 +113,16 @@ func (a *api) enqueue(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, errors.New("body is required"))
 		return
 	}
+	delay, err := boundedMS(req.DelayMS, maxDelay, "delay_ms")
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
 
 	// This call does not return until the message is on disk and fsynced, so
 	// a 201 here is a durability promise, not just an acknowledgement that
 	// the bytes were parsed.
-	m, err := q.Enqueue(req.Body, req.Priority, ms(req.DelayMS))
+	m, err := q.Enqueue(req.Body, req.Priority, delay)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, queue.ErrPriorityDisabled) {
@@ -124,15 +147,29 @@ func (a *api) receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req receiveReq
-	if r.ContentLength > 0 && !decode(w, r, &req) {
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Max < 0 || req.Max > maxBatch {
+		fail(w, http.StatusBadRequest, fmt.Errorf("max must be between 0 and %d", maxBatch))
+		return
+	}
+	visibility, err := boundedMS(req.VisibilityMS, maxVisibility, "visibility_ms")
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	wait, err := boundedMS(req.WaitMS, maxWait, "wait_ms")
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
 		return
 	}
 
-	msgs, err := q.Receive(r.Context(), req.Max, ms(req.VisibilityMS), ms(req.WaitMS))
+	msgs, err := q.Receive(r.Context(), req.Max, visibility, wait)
 	if err != nil {
 		// A cancelled request context means the consumer hung up mid long
 		// poll. There is nobody left to send a response to.
-		if errors.Is(err, r.Context().Err()) {
+		if r.Context().Err() != nil {
 			return
 		}
 		fail(w, http.StatusInternalServerError, err)
@@ -186,7 +223,12 @@ func (a *api) nack(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := q.Nack(req.Receipt, ms(req.DelayMS)); err != nil {
+	delay, err := boundedMS(req.DelayMS, maxDelay, "delay_ms")
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := q.Nack(req.Receipt, delay); err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, queue.ErrNoLease) {
 			status = http.StatusConflict
@@ -203,6 +245,7 @@ type replayReq struct {
 	// Source is "dlq" to drain the dead letter queue, or "log" to re-enqueue
 	// history straight out of the write ahead log.
 	Source      string `json:"source"`
+	Epoch       uint64 `json:"epoch"`
 	FromOffset  int64  `json:"from_offset"`
 	SinceUnixMS int64  `json:"since_unix_ms"`
 }
@@ -215,24 +258,45 @@ func (a *api) replay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req replayReq
-	if r.ContentLength > 0 && !decode(w, r, &req) {
+	if !decode(w, r, &req) {
 		return
 	}
 
 	switch req.Source {
 	case "", "dlq":
-		respond(w, http.StatusOK, map[string]any{"source": "dlq", "replayed": q.ReplayDLQ()})
+		n, err := q.ReplayDLQ()
+		if err != nil {
+			// The count is reported alongside the error, because everything
+			// counted is already live and a blind retry would duplicate it.
+			respond(w, http.StatusInternalServerError, map[string]any{
+				"source": "dlq", "replayed": n, "error": err.Error(),
+			})
+			return
+		}
+		respond(w, http.StatusOK, map[string]any{"source": "dlq", "replayed": n})
+
 	case "log":
+		if req.FromOffset < 0 {
+			fail(w, http.StatusBadRequest, errors.New("from_offset must not be negative"))
+			return
+		}
 		var since time.Time
 		if req.SinceUnixMS > 0 {
 			since = time.UnixMilli(req.SinceUnixMS)
 		}
-		n, err := a.mgr.Replay(name, req.FromOffset, since)
+		n, err := a.mgr.Replay(name, queue.Bookmark{Epoch: req.Epoch, Offset: req.FromOffset}, since)
 		if err != nil {
-			fail(w, http.StatusInternalServerError, err)
+			status := http.StatusInternalServerError
+			if errors.Is(err, queue.ErrStaleBookmark) || errors.Is(err, queue.ErrCorrupt) {
+				status = http.StatusBadRequest
+			}
+			respond(w, status, map[string]any{
+				"source": "log", "replayed": n, "error": err.Error(),
+			})
 			return
 		}
 		respond(w, http.StatusOK, map[string]any{"source": "log", "replayed": n})
+
 	default:
 		fail(w, http.StatusBadRequest, errors.New(`source must be "dlq" or "log"`))
 	}
@@ -241,22 +305,35 @@ func (a *api) replay(w http.ResponseWriter, r *http.Request) {
 // --- admin ---
 
 func (a *api) compact(w http.ResponseWriter, r *http.Request) {
-	before := a.mgr.Offset()
+	before := a.mgr.Bookmark()
 	if err := a.mgr.Compact(); err != nil {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
+	after := a.mgr.Bookmark()
 	respond(w, http.StatusOK, map[string]any{
-		"bytes_before": before,
-		"bytes_after":  a.mgr.Offset(),
+		"bytes_before": before.Offset,
+		"bytes_after":  after.Offset,
+		"epoch":        after.Epoch,
+		"note":         "bookmarks issued before this compaction are no longer valid",
 	})
 }
 
-func (a *api) offset(w http.ResponseWriter, r *http.Request) {
-	respond(w, http.StatusOK, map[string]any{"offset": a.mgr.Offset()})
+func (a *api) bookmark(w http.ResponseWriter, r *http.Request) {
+	respond(w, http.StatusOK, a.mgr.Bookmark())
 }
 
+// health reports the state of the storage engine rather than the liveness of
+// the process. A server whose log has failed is still answering requests, and
+// a static "ok" would hide exactly the condition an operator needs to see.
 func (a *api) health(w http.ResponseWriter, r *http.Request) {
+	if err := a.mgr.Err(); err != nil {
+		respond(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "degraded",
+			"error":  err.Error(),
+		})
+		return
+	}
 	respond(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
@@ -273,14 +350,39 @@ func (a *api) withLogging(next http.Handler) http.Handler {
 	})
 }
 
+// decode reads a JSON body, treating an absent body as an empty object.
+//
+// It deliberately does not test ContentLength first. Go reports -1 for any
+// chunked or streaming body, so gating on a positive length silently drops
+// the whole request and dispatches the zero value instead, which on the
+// replay endpoint means running a completely different operation than the
+// caller asked for.
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields() // a typo in a field name should be loud
 	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true // no body at all, defaults apply
+		}
 		fail(w, http.StatusBadRequest, err)
 		return false
 	}
 	return true
+}
+
+// boundedMS converts milliseconds to a duration, rejecting negatives and
+// anything past the ceiling. The comparison happens in milliseconds, before
+// the multiply, so an enormous value is rejected rather than overflowing into
+// a negative duration.
+func boundedMS(n int, max time.Duration, field string) (time.Duration, error) {
+	if n < 0 {
+		return 0, fmt.Errorf("%s must not be negative", field)
+	}
+	limit := int64(max / time.Millisecond)
+	if int64(n) > limit {
+		return 0, fmt.Errorf("%s must be at most %d ms", field, limit)
+	}
+	return time.Duration(n) * time.Millisecond, nil
 }
 
 func respond(w http.ResponseWriter, status int, body any) {
@@ -292,5 +394,3 @@ func respond(w http.ResponseWriter, status int, body any) {
 func fail(w http.ResponseWriter, status int, err error) {
 	respond(w, status, map[string]string{"error": err.Error()})
 }
-
-func ms(n int) time.Duration { return time.Duration(n) * time.Millisecond }

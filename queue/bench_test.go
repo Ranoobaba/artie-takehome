@@ -46,10 +46,25 @@ func BenchmarkEnqueue(b *testing.B) {
 	}
 }
 
-// BenchmarkReceiveAck measures the consume side, where the fsync is on the
-// ack rather than the enqueue.
+// BenchmarkReceiveAck measures the consume side. Ack calls AppendSync, so it
+// pays exactly the same fsync as Enqueue and must be measured at both sync
+// settings. Reporting only the group commit number would suggest acking is
+// hundreds of times cheaper than enqueuing, which is true only when group
+// commit is on and false at the shipped default.
 func BenchmarkReceiveAck(b *testing.B) {
-	mgr, err := Open(filepath.Join(b.TempDir(), "q.wal"), 10*time.Millisecond, time.Hour)
+	for _, tc := range []struct {
+		name string
+		sync time.Duration
+	}{
+		{"fsync-per-write", 0},
+		{"group-commit-10ms", 10 * time.Millisecond},
+	} {
+		b.Run(tc.name, func(b *testing.B) { benchReceiveAck(b, tc.sync) })
+	}
+}
+
+func benchReceiveAck(b *testing.B, syncEvery time.Duration) {
+	mgr, err := Open(filepath.Join(b.TempDir(), "q.wal"), syncEvery, time.Hour)
 	if err != nil {
 		b.Fatal(err)
 	}

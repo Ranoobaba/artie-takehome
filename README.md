@@ -19,7 +19,7 @@ interleaving that produces a duplicate is traced in
 
 ## Quick start
 
-Requires Go 1.22 or newer. Nothing else.
+Requires Go 1.24 or newer. Nothing else.
 
 ```bash
 go run .                 # starts on :8080, log at data/queue.wal
@@ -161,9 +161,10 @@ the producer we had a message that existed only in memory.
 **Recovery.** On startup the log is replayed from byte zero and the heaps are
 rebuilt. The rule that keeps this simple is that **a lease never survives a
 restart**: any message checked out when the process died goes back to ready,
-because that consumer is definitionally gone. Attempt counts do survive, so a
-message that reliably kills its consumer still reaches the dead letter queue
-instead of looping forever.
+because that consumer is definitionally gone. Attempt counts and nack backoffs
+do survive, so a message that reliably kills its consumer still reaches the
+dead letter queue instead of looping forever, and a consumer's backoff is not
+erased by a restart.
 
 **Torn tails.** A process killed mid write leaves a partial record. Recovery
 detects it by short read or CRC mismatch, truncates the log at the last good
@@ -178,6 +179,18 @@ current state, then swapped in with `rename`, which is atomic on POSIX. The
 directory is fsynced too, because a rename is a metadata operation and can
 otherwise be lost even when the file contents are durable.
 
+Compaction is **stop the world**, and deliberately so. The snapshot and the
+rename have to be one atomic step: anything appended between them is erased by
+the rename, and erased silently, because its producer was already told the
+write was durable. It therefore holds the manager lock and every queue lock for
+its duration. Compaction is rare maintenance, so blocking traffic briefly is
+the right trade against losing acknowledged writes.
+
+**Epochs.** Compaction rewrites the file from byte zero, so a byte offset
+issued before it no longer names the bytes a client thinks it names. Every
+bookmark therefore carries an epoch alongside its offset, and a replay against
+a stale epoch is refused rather than reinterpreted.
+
 **Verified against SIGKILL, not a graceful shutdown:**
 
 ```
@@ -190,17 +203,22 @@ Queue config, messages, priorities, and LIFO ordering all survive.
 
 ### The cost, measured
 
-`go test -bench=. -benchtime=2000x`, Apple Silicon, Go 1.27, local SSD:
+`go test -bench=.`, Apple Silicon, Go 1.27, local SSD:
 
-| Configuration | Per op | Throughput | What a 201 means |
+| Operation | Sync mode | Per op | Throughput |
 |---|---|---|---|
-| fsync per write (default) | 4.42 ms | ~226 msg/s | the bytes are on the disk |
-| group commit, 1 ms | 82 µs | ~12,200 msg/s | on disk within 1 ms |
-| group commit, 10 ms | 8.8 µs | ~113,000 msg/s | on disk within 10 ms |
-| receive plus ack | 24.8 µs | ~40,000 msg/s | |
-| recovery | 140 ms per 50,000 messages | ~358,000 msg/s | |
+| enqueue | fsync per write (default) | 4.14 ms | ~241 msg/s |
+| enqueue | group commit, 1 ms | 465 µs | ~2,150 msg/s |
+| enqueue | group commit, 10 ms | 23.4 µs | ~42,800 msg/s |
+| receive plus ack | fsync per write (default) | 4.25 ms | ~235 msg/s |
+| receive plus ack | group commit, 10 ms | 22.1 µs | ~45,200 msg/s |
+| recovery | | 120 ms per 50,000 messages | ~418,000 msg/s |
 
-Durability costs a factor of 500. That is not a bug to optimise away, it is
+Ack is listed at both settings on purpose. It calls the same durable append
+that enqueue does, so at the default it costs the same 4 ms, not the
+microseconds a group commit number on its own would imply.
+
+Durability costs roughly a factor of 180. That is not a bug to optimise away, it is
 what fsync costs, and it is why the knob exists rather than a default. The
 default is the safe one, because the person accepting a window of possible loss
 should be the person who has decided how large it can be.
@@ -252,7 +270,7 @@ ok  	artie-takehome/queue	23.115s
 | `POST` | `/queues/{name}/nack` | return to the queue, with optional backoff |
 | `POST` | `/queues/{name}/replay` | replay the dead letter queue or the log |
 | `POST` | `/admin/compact` | rewrite the log to live state only |
-| `GET` | `/offset` | current log offset, usable as a replay bookmark |
+| `GET` | `/bookmark` | current epoch and log offset, for replaying later |
 | `GET` | `/healthz` | liveness |
 
 ```bash
@@ -269,8 +287,53 @@ curl -XPOST localhost:8080/queues/orders/ack -d '{"receipt":"..."}'
 ```
 
 `GET /queues/{name}` reports ready, delayed, inflight, and dead letter depths,
-lifetime counters, and the age of the oldest ready message, which is the first
-number anyone asks for when a queue looks wedged.
+lifetime counters, the age of the oldest ready message, and a `degraded` field
+carrying any storage error that happened on a background path. The lifetime
+counters are per process, so they restart at zero, while the depths come from
+the log.
+
+`GET /healthz` reports the state of the storage engine, not just process
+liveness. A server whose log has failed is still answering requests, and a
+static `ok` would hide exactly the condition worth paging on.
+
+---
+
+## Correctness
+
+The suite is 25 tests covering ordering, delay composition, leases, dead
+lettering, durability across restart, torn tails, compaction, replay, and
+concurrency. It runs clean under `go test -race`, and `go vet` and `gofmt` are
+clean.
+
+An adversarial review pass was run over the finished code and found real
+defects, concentrated almost entirely at the storage boundary and in the HTTP
+layer rather than in the queue logic. The ones worth naming, because each is a
+class of mistake rather than a typo:
+
+- **A reader that could write.** Every failure path in the log scanner
+  truncated the log, and the replay endpoint fed it a client supplied offset.
+  Naming an offset that did not land on a record boundary deleted the log and
+  still answered 200. Recovery and replay are now separate entry points, and
+  only recovery may repair.
+- **A snapshot that was not atomic with its use.** Compaction is now stop the
+  world, as described above.
+- **A mutation that preceded its log record.** The receive path updated the
+  heaps before writing its lease records, so a storage failure stranded
+  messages as leased under receipts nobody ever received. It now writes first
+  and rolls back on failure, matching enqueue and ack.
+- **A durable operation that was not durable.** Nack recorded only a message
+  ID and recovery had no case for it, so a restart erased every consumer's
+  backoff at once.
+- **Errors thrown away where nobody was listening.** Failed fsyncs in the group
+  commit path and failed dead letter appends were discarded, so the process
+  kept returning 201 for writes that were not going to be there. Storage
+  failures are now latched and surfaced through `/healthz` and the `degraded`
+  field on stats.
+- **Unbounded client input.** A large enough `delay_ms` overflowed into the
+  past and delivered immediately; `wait_ms` had no ceiling. Both are bounded.
+
+Every one of those has a regression test that fails without its fix, under
+`--- regressions ---` in `queue/queue_test.go`.
 
 ---
 
@@ -324,10 +387,15 @@ counts reset, which is the operational move after fixing whatever was breaking.
 
 **Historical replay** is the interesting kind, and it is available because the
 storage engine is a log rather than a pile of mutable records. Every enqueue is
-still sitting in the file in order. `GET /offset` returns a bookmark, and
-`POST /queues/{name}/replay` with `{"source":"log","from_offset":N}` re-enqueues
-everything that arrived after it. `since_unix_ms` filters by wall clock
-instead.
+still sitting in the file in order. `GET /bookmark` returns `{epoch, offset}`,
+and `POST /queues/{name}/replay` with `{"source":"log","epoch":E,"from_offset":N}`
+re-enqueues everything that arrived after it. `since_unix_ms` filters by wall
+clock instead.
+
+A replay is strictly read only. The scanner that recovery uses can repair a
+torn tail, but the one replay uses cannot, because a replay offset comes from
+a client and a reader that repairs on error is a reader that deletes data on
+behalf of whoever supplied its arguments.
 
 Replayed messages are genuinely new: new IDs, new sequence numbers, zero
 attempts. Resurrecting the original IDs would collide with any copy still live
@@ -467,10 +535,14 @@ Stated plainly, since the honest list is more useful than a feature list.
 - **One lock per queue, held across the fsync.** A slow disk write blocks every
   other operation on that queue. This is the throughput ceiling and it is
   measured above rather than estimated.
+- **Compaction blocks all traffic** for its duration, by design. Acceptable
+  because it is rare and manual, unacceptable if it were automatic and
+  frequent, which is why it is neither.
 - **Every message lives in memory.** The log is the durable copy, but the heaps
   hold the full working set. A very deep queue is bounded by RAM.
-- **Historical replay only reaches the last compaction.** Retention is a side
-  effect rather than a policy.
+- **Historical replay only reaches the last compaction,** and bookmarks issued
+  before a compaction are refused. Retention is a side effect rather than a
+  policy.
 - **Priority is a plain integer with no starvation protection.** A steady
   stream of high priority messages will starve low priority ones indefinitely.
   Ageing, where priority rises with wait time, is the standard fix and is not
@@ -479,6 +551,11 @@ Stated plainly, since the honest list is more useful than a feature list.
   message asking for a 10 ms delay may wait up to 60 ms.
 - **`nack` backoff is whatever the consumer passes.** There is no server side
   exponential backoff policy.
+- **Lifetime counters are per process** and restart at zero. Queue depths come
+  from the log and do not.
+- **Retired file handles from compaction are held until shutdown,** so a
+  process that compacts thousands of times without restarting will accumulate
+  descriptors. Bounded by compaction count, not by traffic.
 - **No message size limit,** so a single enormous body could exhaust memory.
 - **Group commit is all or nothing per process.** It cannot be selected per
   queue or per message, though the right design is probably a durability level
