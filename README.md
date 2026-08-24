@@ -95,8 +95,8 @@ function the brief really asks for.
 | Why choose this over SQS, RabbitMQ or Pulsar? | [Why this](#why-would-users-choose-your-queue-over-incumbents-like-amazon-sqs-rabbitmq-or-apache-pulsar) |
 
 Two sections worth reading even if you skip the rest:
-[Replication](#replication-the-largest-gap), because it is the largest gap and
-the fix is unusually clean, and [Limitations](#limitations), which is the
+[Replication](#replication-and-why-it-is-not-here), because it is the one thing
+deliberately left out and the fix is unusually clean, and [Limitations](#limitations), which is the
 honest list rather than a feature list.
 
 ### Reading the code
@@ -108,6 +108,55 @@ Bottom up, about twenty minutes:
 3. `queue/queue.go` — enqueue, lease, ack, expiry, dead letter
 4. `queue/wal.go` — the storage engine: append, fsync, CRC, recover, compact
 5. `queue/manager.go` — many queues, crash recovery, replay
+
+---
+
+## Strengths, weaknesses, and the tradeoffs
+
+### Why you would use it
+
+- **It runs in five seconds.** One binary, zero dependencies, no cluster, no
+  broker, no AWS account. `go run .` and you have a durable queue.
+- **It does orderings the incumbents cannot.** None of SQS, RabbitMQ, Pulsar or
+  Kafka do LIFO. SQS has no priority at all and caps delay at fifteen minutes.
+- **It is small enough to change.** The queue engine is 1,632 lines. A new
+  ordering rule is one line in one function.
+- **The durability is checkable rather than claimed.** A 201 means the bytes
+  are fsynced, and `make verify` proves it against SIGKILL.
+
+Good fit for local development, CI and integration tests, on premise and edge
+deployments, and any workload that genuinely needs delayed, prioritised or
+newest first delivery.
+
+### Why you would not
+
+- **It runs on one machine.** No replication, no failover. Scoped out on
+  purpose, see [Replication](#replication-and-why-it-is-not-here).
+- **Depth is bounded by RAM.** The log is the durable copy, but the heaps hold
+  every live message.
+- **241 messages a second** at the safe fsync setting. Group commit raises that
+  by a factor of 180, at a stated cost.
+- **No authentication, no client libraries, no operational tooling.**
+
+Reach for SQS if you are on AWS and want to stop thinking about it, RabbitMQ if
+you need routing topologies, Pulsar if you need multi tenant streaming at
+scale.
+
+### The tradeoffs
+
+Every row was a fork with a real alternative.
+
+| Decision | What it bought | What it cost |
+|---|---|---|
+| Single node, no replication | no consensus, no leader election, one binary | a disk failure loses everything |
+| Log structured storage | sequential writes, recovery is just a replay, replay and pub/sub nearly free | the log grows, so compaction is required |
+| fsync before every 201 | a 201 means the bytes are on the disk | 241 msg/s, 180x slower than group commit |
+| Working set in memory | O(log n) everywhere, no disk read on receive | depth bounded by RAM |
+| One lock per queue, held across the fsync | obviously correct, and the race detector proves it | one slow write stalls the whole queue |
+| Leases rather than destructive reads | a consumer that dies does not lose its message | at least once, so duplicates are possible |
+| Stop the world compaction | cannot lose an acknowledged write | blocks all traffic while it runs |
+| JSON records in the log | you can `cat` the log and read it | records several times larger than needed |
+| Priority as an unbounded integer | simple, no tier count to choose up front | high priority traffic starves low priority |
 
 ---
 
@@ -530,8 +579,9 @@ a key to one consumer while it has work in flight.
 
 Ordered by what I would actually do first.
 
-1. **Replication.** The single largest gap, and the fix is unusually cheap
-   because the storage is already log shaped. It has its own section below.
+1. **Replication.** Left out on purpose rather than missed, and the fix is
+   unusually cheap because the storage is already log shaped. It has its own
+   section below.
 2. **Retention as a policy rather than an accident.** Time and size based
    retention decoupled from acks, so historical replay has a defined window.
    Prerequisite for the pub/sub work above.
@@ -598,13 +648,20 @@ infrastructure at all.
 
 ---
 
-## Replication, the largest gap
+## Replication, and why it is not here
 
-Durability here means one machine's disk. A process crash is survived, and
-verified with SIGKILL rather than a graceful shutdown. A disk failure is not
-survived. There is no second copy and no failover.
+**This was scoped out on purpose.** The thing this design is best at is being a
+single binary with no dependencies that you can start with `go run .`. A three
+node Raft cluster is a different product, and building one would have cost
+exactly the property that makes this one worth using. Bare bones was the goal,
+not the budget.
 
-The fix is unusually cheap, and the reason is worth explaining.
+So durability here means one machine's disk. A process crash is survived, and
+verified with SIGKILL rather than a graceful shutdown. A disk failure is not.
+
+What follows is what adding replication would look like, because the answer is
+unusually clean and it is the strongest thing there is to say about the storage
+design.
 
 **Raft is two things: a replicated log, and a state machine that applies that
 log in order.** Storage here is already an append only log of ordered records,
@@ -660,12 +717,48 @@ brief asked for the first one.
 
 ---
 
+## Questions you might have
+
+**Why a heap and not a sorted list?** Insert and extract are both O(log n) and
+peek is O(1). It matters most for the two time driven heaps: scanning every
+outstanding lease on each tick would be O(n), whereas a min heap on expiry lets
+the pump check one element to know whether there is any work at all.
+
+**Why fsync before returning 201?** Because a 201 is a promise. The reverse
+order would acknowledge a message that exists only in memory. A crash between
+the fsync and the heap insert is safe, because recovery replays the record.
+
+**Then why not fsync when a lease is taken?** Losing a lease record only causes
+a redelivery, which at least once delivery already permits. Paying four
+milliseconds to prevent a duplicate we are allowed to produce anyway would be
+the wrong trade.
+
+**What happens if a consumer dies holding a message?** Its lease expires, the
+message returns to ready with its attempt count incremented, and past the limit
+it dead letters. Each delivery mints a fresh receipt, so the dead consumer
+waking up later cannot acknowledge work that has since been handed to somebody
+else.
+
+**Can you get exactly once?** No. The gap between the side effect happening and
+the acknowledgement arriving cannot be made atomic across two independent
+systems. Consumers need an idempotency key. Exactly once as a product claim
+always means at least once delivery plus deduplication somewhere.
+
+**What is the throughput bottleneck?** One lock per queue, held across the
+fsync. The fix is batch enqueue and then moving the fsync off the lock, which
+is possible because every record already carries its own sequence number, so
+out of order log entries still replay correctly.
+
+---
+
 ## Limitations
 
 Stated plainly, since the honest list is more useful than a feature list.
 
-- **Single node, no replication.** Survives a process crash, not a disk
-  failure. The most significant gap.
+- **Single node, by choice.** Survives a process crash, not a disk failure.
+  Left out to keep this a single binary with no dependencies.
+  [Replication](#replication-and-why-it-is-not-here) covers what adding it
+  would look like and what it would cost.
 - **No authentication or authorization.** Any caller can do anything.
 - **One lock per queue, held across the fsync.** A slow disk write blocks every
   other operation on that queue. This is the throughput ceiling and it is
