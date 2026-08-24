@@ -176,6 +176,22 @@ Every row was a fork with a real alternative.
 
 ---
 
+### Why Go
+
+No language was specified, so this is a decision rather than a default. Each of
+the brief's hard requirements pointed the same way.
+
+| The requirement | What Go gave |
+|---|---|
+| Queue must support concurrency | `go test -race` ships in the toolchain, so the concurrency claim is machine checked rather than asserted. `make verify` runs it. |
+| Persisted, durable, survives restarts | `f.Sync()` is one line to the fsync syscall with no buffering in between. On macOS Go issues `F_FULLFSYNC` rather than plain `fsync`, which flushes the drive's own write cache too. That is why the benchmark reads 4.14 ms rather than microseconds: it is a real barrier, not a cheaper number. |
+| Storage cannot be delegated to a queue or database | `container/heap`, `hash/crc32`, `encoding/binary`, `encoding/json` and `net/http` are all standard library, so writing a storage engine from scratch needed nothing installed and the module has no dependencies. |
+| HTTP application | Method and path routing is in the standard router, so there was no framework to choose or justify, and the whole thing compiles to one binary that runs with `go run .` |
+
+The background pump that drives both clocks is one goroutine and five lines.
+
+---
+
 ## The core idea
 
 The brief asks for FIFO, LIFO, priority, and delay, combinable. The
