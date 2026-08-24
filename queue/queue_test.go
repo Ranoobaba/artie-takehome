@@ -883,3 +883,83 @@ func TestConcurrentReplayAndCompact(t *testing.T) {
 		t.Fatalf("lost messages: ready=%d, want at least 300", s.Ready)
 	}
 }
+
+// --- lease extension ---
+
+// A job that runs longer than the visibility timeout must be able to hold its
+// claim. Without this the queue can only serve jobs shorter than the timeout.
+func TestExtendKeepsLeaseAlive(t *testing.T) {
+	_, q, _ := open(t, Config{Name: "q", Mode: FIFO})
+	q.Enqueue("long-job", 0, 0)
+
+	msgs, _ := q.Receive(context.Background(), 1, 80*time.Millisecond, 0)
+	if len(msgs) != 1 {
+		t.Fatal("no message")
+	}
+	receipt := msgs[0].Receipt
+
+	// Heartbeat three times, each before the current lease runs out.
+	for i := 0; i < 3; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if _, err := q.Extend(receipt, 80*time.Millisecond); err != nil {
+			t.Fatalf("heartbeat %d: %v", i+1, err)
+		}
+	}
+
+	// Well past the original 80ms expiry, and it is still ours.
+	if got := drain(t, q, 1); len(got) != 0 {
+		t.Fatalf("message was redelivered despite heartbeats: %v", got)
+	}
+	if err := q.Ack(receipt); err != nil {
+		t.Fatalf("the original receipt should still be valid: %v", err)
+	}
+}
+
+// Extending is not a way to reclaim a lease that already lapsed. By then the
+// message may belong to another consumer.
+func TestExtendRejectsLapsedLease(t *testing.T) {
+	_, q, _ := open(t, Config{Name: "q", Mode: FIFO})
+	q.Enqueue("work", 0, 0)
+
+	msgs, _ := q.Receive(context.Background(), 1, 50*time.Millisecond, 0)
+	stale := msgs[0].Receipt
+
+	time.Sleep(120 * time.Millisecond)
+	q.Tick(time.Now())
+
+	if _, err := q.Extend(stale, time.Minute); err != ErrNoLease {
+		t.Fatalf("a lapsed lease was extended, got %v", err)
+	}
+}
+
+// The inflight heap is ordered by lease expiry and the pump only ever looks at
+// its root, so changing an expiry without re-heapifying hides every lease
+// behind it. This is the test for the heap.Fix call in Extend.
+func TestExtendReordersInflightHeap(t *testing.T) {
+	_, q, _ := open(t, Config{Name: "q", Mode: FIFO})
+	q.Enqueue("a", 0, 0)
+	q.Enqueue("b", 0, 0)
+
+	first, _ := q.Receive(context.Background(), 1, 60*time.Millisecond, 0)
+	second, _ := q.Receive(context.Background(), 1, 200*time.Millisecond, 0)
+	if len(first) != 1 || len(second) != 1 || first[0].Body != "a" || second[0].Body != "b" {
+		t.Fatalf("setup: got %v and %v", first, second)
+	}
+
+	// "a" sits at the root because it expires soonest. Pushing it past "b"
+	// must move it, or the pump peeks at "a", sees a future expiry, stops,
+	// and never reclaims "b" at all.
+	if _, err := q.Extend(first[0].Receipt, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	q.Tick(time.Now())
+
+	if s := q.Stats(); s.Ready != 1 || s.Inflight != 1 {
+		t.Fatalf("ready=%d inflight=%d, want 1 and 1: the extended lease hid the expired one", s.Ready, s.Inflight)
+	}
+	if got := drain(t, q, 5); len(got) != 1 || got[0] != "b" {
+		t.Fatalf("got %v, want [b]", got)
+	}
+}

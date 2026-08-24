@@ -268,6 +268,7 @@ ok  	artie-takehome/queue	23.115s
 | `POST` | `/queues/{name}/receive` | lease messages, supports long polling |
 | `POST` | `/queues/{name}/ack` | confirm and delete |
 | `POST` | `/queues/{name}/nack` | return to the queue, with optional backoff |
+| `POST` | `/queues/{name}/extend` | renew a live lease, for jobs longer than the timeout |
 | `POST` | `/queues/{name}/replay` | replay the dead letter queue or the log |
 | `POST` | `/admin/compact` | rewrite the log to live state only |
 | `GET` | `/bookmark` | current epoch and log offset, for replaying later |
@@ -300,7 +301,7 @@ static `ok` would hide exactly the condition worth paging on.
 
 ## Correctness
 
-The suite is 25 tests covering ordering, delay composition, leases, dead
+The suite is 28 tests covering ordering, delay composition, leases, dead
 lettering, durability across restart, torn tails, compaction, replay, and
 concurrency. It runs clean under `go test -race`, and `go vet` and `gofmt` are
 clean.
@@ -453,11 +454,8 @@ a key to one consumer while it has work in flight.
 
 Ordered by what I would actually do first.
 
-1. **Replication.** The single largest gap. The log survives a process restart
-   but not a disk. I would add a Raft group over the log, since the log already
-   is a replicated state machine's state machine, and commit a record once a
-   quorum has it rather than once the local disk has it. This turns durability
-   from "one machine's SSD" into a real guarantee.
+1. **Replication.** The single largest gap, and the fix is unusually cheap
+   because the storage is already log shaped. It has its own section below.
 2. **Retention as a policy rather than an accident.** Time and size based
    retention decoupled from acks, so historical replay has a defined window.
    Prerequisite for the pub/sub work above.
@@ -485,43 +483,103 @@ Ordered by what I would actually do first.
 
 ### Why would users choose your queue over incumbents like Amazon SQS, RabbitMQ or Apache Pulsar?
 
-For most production workloads, they should not, and I would rather say that
-plainly than oversell a two hour build. SQS, RabbitMQ and Pulsar have
-replication, operational tooling, client libraries in every language, and years
-of production hardening. None of that is here.
+Three plain reasons, and one plain reason not to.
 
-There are three narrow cases where this is genuinely the better answer.
+**It is running in five seconds.** `go run .` and you have a durable queue. No
+cluster, no broker, no config file, no AWS account, no IAM policy. Pulsar wants
+three services up before it does anything. That gap matters most for local
+development, CI, on premise and edge deployments, where standing up real
+infrastructure is out of proportion to the job.
 
-**1. The ordering combination the brief asks for does not exist in the
-incumbents.** This is the real differentiator, and it is not a small one.
+**It does orderings they cannot.**
 
-| | Priority | LIFO | Delay | Combined |
+| | Priority | LIFO | Delay | All three |
 |---|---|---|---|---|
 | SQS | none at all | no | capped at 15 minutes | no |
-| RabbitMQ | yes, with caveats and a fixed level count | no | plugin | awkward |
+| RabbitMQ | bounded levels, with caveats | no | via plugin | awkward |
 | Pulsar | no native priority | no | yes | no |
+| Kafka | no | no | no | no |
 | this | yes | yes | unbounded | yes, by construction |
 
-A delayed priority LIFO is one line of config here. Getting it out of SQS means
-priority tiers as separate queues plus a scheduler you write and operate, and
-LIFO is not expressible at all. If that is the shape of your problem, this is
-not a worse SQS, it is a different tool.
+None of them do LIFO. SQS has no priority at all. If you need newest first,
+urgent first, and hold this one for three days, no incumbent does it at any
+price.
 
-**2. Zero operational surface.** One binary, no cluster, no broker, no
-ZooKeeper, no AWS account, no network dependency. `go run .` and you have a
-durable queue. For local development, integration tests, CI, an on premise
-deployment, or an edge device, standing up Pulsar is not proportionate.
+**You can change it.** Around 1,200 lines you can read in an afternoon. A new
+ordering rule is one line in one function. Adding LIFO to SQS is not a question
+of effort or budget, it is not possible.
 
-**3. Legibility.** The whole storage engine is one readable file. When
-durability behaviour matters and you need to know exactly what a 201 means, "it
-fsyncs the record before returning, here is the line" is worth something that a
-managed service cannot offer.
+**And why you would not: it runs on one machine.** No replication, no failover.
+The disk dies and the data dies. What fixing that looks like is the next
+section.
 
-Against those: no replication, no HA, bounded by one machine's disk and one
-lock per queue, no mature client ecosystem, no authentication, and the entire
-operational burden is yours. Choose SQS if you are on AWS and want to stop
-thinking about it, RabbitMQ if you need routing topologies, and Pulsar if you
-need durable multi tenant streaming at scale.
+For most production workloads, use an incumbent. SQS if you are on AWS and want
+to stop thinking about it, RabbitMQ if you need routing topologies, Pulsar if
+you need durable multi tenant streaming at scale. Use this if you need an
+ordering combination none of them express, or a durable queue with no
+infrastructure at all.
+
+---
+
+## Replication, the largest gap
+
+Durability here means one machine's disk. A process crash is survived, and
+verified with SIGKILL rather than a graceful shutdown. A disk failure is not
+survived. There is no second copy and no failover.
+
+The fix is unusually cheap, and the reason is worth explaining.
+
+**Raft is two things: a replicated log, and a state machine that applies that
+log in order.** Storage here is already an append only log of ordered records,
+and the queue is already a state machine that rebuilds itself by replaying
+those records in order. That is not similar to Raft's shape, it is Raft's
+shape. Most systems adopting Raft have to invent a log to feed it and then
+reconcile that log against however they already store data. Here the log
+exists, and it already carries the total order the sequence numbers depend on.
+
+One line of the write path changes:
+
+```
+today        Enqueue -> append locally -> fsync -> 201
+replicated   Enqueue -> propose to the group -> a quorum has it -> apply -> 201
+```
+
+- The state machine does not change at all. Three heaps, the same comparator,
+  the same delay gate, the same lease logic.
+- `AppendSync` changes meaning, from "write locally and fsync" to "propose and
+  wait for commit". One function.
+- Recovery does not change. Replaying a log is replaying a log, whether the
+  records arrived from local disk or from a leader.
+
+**The part worth leading with.** Once a majority of nodes hold a record, the
+fsync leaves the critical path. One machine losing power stops being a data
+loss event, because the others still have the record. That is the trade etcd
+and Kafka both make. So the 4.14 millisecond full flush is replaced by one
+network round trip inside a datacentre, comfortably under a millisecond.
+Durability goes up and latency goes down at the same time, which is a rare
+combination and is only available because the storage is log shaped rather than
+records updated in place.
+
+What stays hard, and one thing that does not:
+
+- **Leases on failover are already handled.** A lease is per node state, so a
+  new leader does not know who holds what. The existing rule covers it: a lease
+  never survives a restart, and from the lease's point of view a failover is a
+  restart. In flight messages return to ready and are redelivered, which at
+  least once delivery already permits.
+- **Read routing.** Consumers reach the leader, or accept stale reads from
+  followers.
+- **Compaction becomes snapshotting.** Raft has a standard answer for this,
+  install snapshot, but the stop the world compaction here would need rewriting
+  against it.
+- **Operational weight.** The honest cost. Three nodes instead of one, cluster
+  membership, and the whole class of problems a distributed system brings. It
+  would cost this design the thing it is currently best at, which is that
+  `go run .` gives you a working durable queue.
+
+Which is why it is the roadmap rather than the build. A single binary with no
+dependencies and a three node Raft cluster are two different products, and the
+brief asked for the first one.
 
 ---
 
@@ -556,6 +614,11 @@ Stated plainly, since the honest list is more useful than a feature list.
 - **Retired file handles from compaction are held until shutdown,** so a
   process that compacts thousands of times without restarting will accumulate
   descriptors. Bounded by compaction count, not by traffic.
+- **No cumulative cap on lease extension.** Each `extend` call is bounded, but
+  a consumer that keeps heartbeating holds a message indefinitely. SQS caps the
+  total at 12 hours from first receipt.
+- **No delete queue, no purge, no peek.** Queues can be created but not
+  removed.
 - **No message size limit,** so a single enormous body could exhaust memory.
 - **Group commit is all or nothing per process.** It cannot be selected per
   queue or per message, though the right design is probably a durability level

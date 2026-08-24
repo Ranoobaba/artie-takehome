@@ -327,6 +327,39 @@ func (q *Queue) Ack(receipt string) error {
 	return nil
 }
 
+// Extend renews a lease that is still live, so a consumer whose work runs
+// longer than the visibility timeout keeps its claim instead of having the
+// message redelivered underneath it while it is still being worked on.
+//
+// Without this the queue can only serve jobs shorter than the visibility
+// timeout, because the alternative is setting a timeout long enough for the
+// slowest possible job, which then delays recovery from every crash by the
+// same amount.
+//
+// Nothing is written to the log. A lease is not durable in the first place,
+// since recovery voids every lease and returns its message to ready, so an
+// extension has nothing to persist. That makes a heartbeat free on disk,
+// which matters because a consumer may send one every few seconds.
+func (q *Queue) Extend(receipt string, visibility time.Duration) (time.Time, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	m, ok := q.leases[receipt]
+	if !ok {
+		return time.Time{}, ErrNoLease
+	}
+	if visibility <= 0 {
+		visibility = q.cfg.Visibility()
+	}
+	m.LeaseExpiry = time.Now().Add(visibility)
+
+	// The inflight heap is ordered by LeaseExpiry and we just changed it, so
+	// the heap invariant has to be restored. heap.Fix is O(log n) and works
+	// from the cached index, so this costs no more than a push.
+	heap.Fix(q.inflight, m.index)
+	return m.LeaseExpiry, nil
+}
+
 // Nack returns a message to the queue without waiting for its lease to run
 // out. delay lets a consumer apply its own backoff rather than being
 // redelivered instantly into the same failure.

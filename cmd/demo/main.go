@@ -83,6 +83,22 @@ func main() {
 	ack(name, back[0].Receipt)
 	fmt.Println("   acked, so it is now permanently gone")
 
+	fmt.Println()
+	fmt.Println("   a worker that is still alive can hold its claim instead of losing it:")
+	enqueue(name, "slow-report", 1, 0)
+	slow := receive(name, 1, 600, 0)
+	for i := 1; i <= 3; i++ {
+		time.Sleep(400 * time.Millisecond)
+		post("/queues/"+name+"/extend", map[string]any{
+			"receipt": slow[0].Receipt, "visibility_ms": 600,
+		})
+		fmt.Printf("   heartbeat %d sent\n", i)
+	}
+	if empty := receive(name, 1, 600, 0); len(empty) == 0 {
+		fmt.Println("   1.2s past the original 600ms lease and nobody else can take it")
+	}
+	ack(name, slow[0].Receipt)
+
 	section("5. A poison message gives up rather than looping forever")
 	enqueue(name, "malformed-payload", 1, 0)
 	for i := 1; i <= 3; i++ {

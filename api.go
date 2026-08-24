@@ -44,6 +44,7 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("POST /queues/{name}/receive", a.receive)
 	mux.HandleFunc("POST /queues/{name}/ack", a.ack)
 	mux.HandleFunc("POST /queues/{name}/nack", a.nack)
+	mux.HandleFunc("POST /queues/{name}/extend", a.extend)
 	mux.HandleFunc("POST /queues/{name}/replay", a.replay)
 	mux.HandleFunc("POST /admin/compact", a.compact)
 	mux.HandleFunc("GET /bookmark", a.bookmark)
@@ -237,6 +238,42 @@ func (a *api) nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, http.StatusOK, map[string]any{"nacked": true})
+}
+
+type extendReq struct {
+	Receipt      string `json:"receipt"`
+	VisibilityMS int    `json:"visibility_ms"`
+}
+
+// extend is the heartbeat a long running consumer sends to keep its claim.
+// SQS calls the same operation ChangeMessageVisibility.
+func (a *api) extend(w http.ResponseWriter, r *http.Request) {
+	q, err := a.mgr.Get(r.PathValue("name"))
+	if err != nil {
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	var req extendReq
+	if !decode(w, r, &req) {
+		return
+	}
+	visibility, err := boundedMS(req.VisibilityMS, maxVisibility, "visibility_ms")
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	expiry, err := q.Extend(req.Receipt, visibility)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, queue.ErrNoLease) {
+			// The lease already lapsed and somebody else may hold the message
+			// now, so this caller has to stop working on it.
+			status = http.StatusConflict
+		}
+		fail(w, status, err)
+		return
+	}
+	respond(w, http.StatusOK, map[string]any{"lease_expires_at": expiry})
 }
 
 // --- replay ---
