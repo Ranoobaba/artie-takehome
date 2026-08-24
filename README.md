@@ -505,7 +505,8 @@ None of them do LIFO. SQS has no priority at all. If you need newest first,
 urgent first, and hold this one for three days, no incumbent does it at any
 price.
 
-**You can change it.** Around 1,200 lines you can read in an afternoon. A new
+**You can change it.** The server is about 2,200 lines and the queue engine
+itself is 1,600 of those. You can read the whole storage layer in one sitting. A new
 ordering rule is one line in one function. Adding LIFO to SQS is not a question
 of effort or budget, it is not possible.
 
