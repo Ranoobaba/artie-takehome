@@ -99,6 +99,22 @@ Two sections worth reading even if you skip the rest:
 deliberately left out and the fix is unusually clean, and [Limitations](#limitations), which is the
 honest list rather than a feature list.
 
+### On AI use
+
+Claude Code was used throughout. The brief did not restrict it, so the full
+conversation is committed at
+[docs/claude-conversation.md](docs/claude-conversation.md) rather than left
+implicit. It starts before the takehome, with me asking how SQS, RabbitMQ and
+Pulsar actually differ, which is where the ordering argument in this README
+came from.
+
+It also contains the adversarial review pass over the finished code. That pass
+found real defects, concentrated at the storage boundary rather than in the
+queue logic: a reader that could truncate the log, a compaction window that
+lost acknowledged writes, a receive path that mutated state before writing its
+record. Every one is fixed, and every fix has a regression test that fails
+without it. See [Correctness](#correctness).
+
 ### Reading the code
 
 Bottom up, about twenty minutes:
