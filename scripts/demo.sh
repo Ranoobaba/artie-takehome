@@ -16,8 +16,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 SRV_PID=""
 
-if [ -t 1 ]; then B=$(tput bold); D=$(tput dim); G=$(tput setaf 2); R=$(tput setaf 1); N=$(tput sgr0)
-else B=""; D=""; G=""; R=""; N=""; fi
+if [ -t 1 ]; then B=$(tput bold); D=$(tput dim); G=$(tput setaf 2); R=$(tput setaf 1); N=$(tput sgr0); JQC="-C"
+else B=""; D=""; G=""; R=""; N=""; JQC=""; fi
 
 cleanup() {
   if [ -n "$SRV_PID" ]; then kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; fi
@@ -33,7 +33,7 @@ bad()   { printf '   %s✗%s %s\n' "$R" "$N" "$1"; }
 
 # Pretty print JSON if a tool is around, otherwise pass it through.
 pretty() {
-  if command -v jq >/dev/null 2>&1; then jq -C "$@" 2>/dev/null || cat
+  if command -v jq >/dev/null 2>&1; then jq $JQC "$@" 2>/dev/null || cat
   elif command -v python3 >/dev/null 2>&1; then python3 -m json.tool 2>/dev/null || cat
   else cat; fi
 }
